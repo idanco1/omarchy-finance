@@ -1,0 +1,19 @@
+{
+  "flex": {
+    "token": "",
+    "queryId": ""
+  },
+  "ai": {
+    "agent": "",
+    "model": ""
+  },
+  "baseCurrency": "USD",
+  "positionsCacheHours": 8,
+  "fxPairs": [
+    ["USD", "ILS"],
+    ["CHF", "ILS"],
+    ["EUR", "ILS"]
+  ],
+  "symbolMap": {},
+  "positions": []
+}

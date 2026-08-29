@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "idanco.finance",
+  "name": "Finance",
+  "version": "1.0.0",
+  "author": "idanco",
+  "description": "IBKR portfolio in the bar: stock prices with D2D/MTD/YTD, FX rates, P&L charts and news",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Finance",
+    "description": "Portfolio pill with detail popup: positions, returns, FX rates, charts and news",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

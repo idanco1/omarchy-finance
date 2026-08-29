@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""Data fetcher for the idanco.finance Omarchy bar plugin.
+
+Stdlib only — no third-party dependencies.
+
+Modes (always prints a single JSON object to stdout):
+  finance-fetch portfolio            portfolio snapshot: positions, returns, FX
+  finance-fetch detail SYMBOL        1y P&L series + news for one holding
+  finance-fetch refresh-positions    force a fresh IBKR Flex fetch, then portfolio
+
+Data sources:
+  - Positions & cost basis: IBKR Flex Web Service (token + query id), or
+    "positions" listed manually in the config file.
+  - Quotes & daily history: Yahoo Finance chart API, falling back to the
+    Nasdaq API (US-listed stocks/ETFs) when Yahoo declines.
+  - FX: frankfurter.dev (ECB reference rates).
+  - News: Google News RSS.
+
+Config: ~/.config/omarchy/finance/config.json (see config.example.json).
+Cache:  ~/.cache/omarchy-finance/
+"""
+
+import concurrent.futures
+import email.utils
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, timedelta, timezone
+
+CONFIG_PATH = os.environ.get(
+    "OMARCHY_FINANCE_CONFIG",
+    os.path.expanduser("~/.config/omarchy/finance/config.json"))
+CACHE_DIR = os.environ.get(
+    "OMARCHY_FINANCE_CACHE",
+    os.path.expanduser("~/.cache/omarchy-finance"))
+
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+FLEX_SEND_URL = ("https://ndcdyn.interactivebrokers.com/AccountManagement/"
+                 "FlexWebService/SendRequest")
+FLEX_GET_URL = ("https://ndcdyn.interactivebrokers.com/AccountManagement/"
+                "FlexWebService/GetStatement")
+
+
+# ---------------------------------------------------------------- utilities
+
+def http_get(url, timeout=10, headers=None, retries=1):
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            hdrs = {"User-Agent": UA, "Accept": "*/*"}
+            if headers:
+                hdrs.update(headers)
+            req = urllib.request.Request(url, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except Exception as e:  # noqa: BLE001 - report the last failure
+            last_err = e
+            if attempt < retries:
+                time.sleep(0.7)
+    raise last_err
+
+
+def read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_json_file(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.tmp%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def cache_path(name):
+    safe = re.sub(r"[^A-Za-z0-9._=-]", "_", name)
+    return os.path.join(CACHE_DIR, safe + ".json")
+
+
+def cached(name, max_age_s, fetch_fn, allow_stale=True):
+    """Return fetch_fn() cached under CACHE_DIR/name for max_age_s seconds.
+
+    On fetch failure, a stale cache entry (any age) is returned when allowed;
+    otherwise the exception propagates.
+    """
+    path = cache_path(name)
+    entry = read_json_file(path)
+    now = time.time()
+    if entry and (now - entry.get("t", 0)) < max_age_s:
+        return entry["v"]
+    try:
+        value = fetch_fn()
+    except Exception:
+        if allow_stale and entry is not None:
+            return entry["v"]
+        raise
+    write_json_file(path, {"t": now, "v": value})
+    return value
+
+
+def load_config():
+    cfg = read_json_file(CONFIG_PATH)
+    return cfg if isinstance(cfg, dict) else None
+
+
+def today_local():
+    return date.today()
+
+
+def fnum(x):
+    """Parse '$1,234.56' / '1234.56' / number → float or None."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = re.sub(r"[$,%\s]", "", str(x))
+    if s in ("", "N/A", "--", "-"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+# ------------------------------------------------------------------- quotes
+#
+# get_history(symbol) → {"price", "currency", "name", "closes": [[iso, c],...]}
+# closes are ascending trading days; the live price is NOT appended to closes.
+
+def yahoo_chart(symbol, range_="1y"):
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+           + urllib.parse.quote(symbol)
+           + "?range=" + range_ + "&interval=1d&includePrePost=false")
+    raw = json.loads(http_get(url, headers={"Accept": "application/json"}))
+    result = raw["chart"]["result"][0]
+    meta = result.get("meta", {})
+    offset = meta.get("gmtoffset", 0) or 0
+    stamps = result.get("timestamp", []) or []
+    quotes = (result.get("indicators", {}).get("quote") or [{}])[0]
+    raw_closes = quotes.get("close", []) or []
+    closes = []
+    for ts, close in zip(stamps, raw_closes):
+        if close is None:
+            continue
+        day = datetime.fromtimestamp(ts + offset, tz=timezone.utc).date()
+        iso = day.isoformat()
+        if closes and closes[-1][0] == iso:
+            closes[-1][1] = float(close)
+        else:
+            closes.append([iso, float(close)])
+    price = fnum(meta.get("regularMarketPrice"))
+    if price is None and closes:
+        price = closes[-1][1]
+    return {
+        "price": price,
+        "currency": meta.get("currency") or "USD",
+        "name": meta.get("longName") or meta.get("shortName") or symbol,
+        "closes": closes,
+    }
+
+
+def nasdaq_get(path):
+    raw = http_get("https://api.nasdaq.com" + path,
+                   headers={"Accept": "application/json",
+                            "Origin": "https://www.nasdaq.com",
+                            "Referer": "https://www.nasdaq.com/"})
+    data = json.loads(raw)
+    if not isinstance(data.get("data"), (dict, list)) or data.get("data") is None:
+        status = (data.get("status") or {}).get("bCodeMessage")
+        raise RuntimeError("nasdaq: no data for %s (%s)" % (path, status))
+    return data["data"]
+
+
+def nasdaq_history(symbol, assetclass, days_back=380):
+    frm = (today_local() - timedelta(days=days_back)).isoformat()
+    to = today_local().isoformat()
+    q = urllib.parse.quote(symbol)
+    info = nasdaq_get("/api/quote/%s/info?assetclass=%s" % (q, assetclass))
+    hist = nasdaq_get(
+        "/api/quote/%s/historical?assetclass=%s&fromdate=%s&todate=%s&limit=9999"
+        % (q, assetclass, frm, to))
+    rows = ((hist.get("tradesTable") or {}).get("rows")) or []
+    closes = []
+    for row in rows:
+        c = fnum(row.get("close"))
+        if c is None:
+            continue
+        try:
+            day = datetime.strptime(row["date"], "%m/%d/%Y").date().isoformat()
+        except (KeyError, ValueError):
+            continue
+        closes.append([day, c])
+    closes.sort(key=lambda r: r[0])
+    primary = info.get("primaryData") or {}
+    price = fnum(primary.get("lastSalePrice"))
+    if price is None and closes:
+        price = closes[-1][1]
+    return {
+        "price": price,
+        "currency": "USD",
+        "name": info.get("companyName") or symbol,
+        "closes": closes,
+    }
+
+
+def fetch_history_uncached(symbol, range_="1y"):
+    errors = []
+    try:
+        return yahoo_chart(symbol, range_)
+    except Exception as e:  # noqa: BLE001
+        errors.append("yahoo: %s" % e)
+    days_back = 1900 if range_ == "5y" else 380
+    for assetclass in ("stocks", "etf"):
+        try:
+            return nasdaq_history(symbol, assetclass, days_back)
+        except Exception as e:  # noqa: BLE001
+            errors.append("nasdaq/%s: %s" % (assetclass, e))
+    raise RuntimeError("; ".join(errors))
+
+
+def get_history(symbol, max_age_s=180, range_="1y"):
+    prefix = "hist_" if range_ == "1y" else "hist%s_" % range_
+    return cached(prefix + symbol, max_age_s,
+                  lambda: fetch_history_uncached(symbol, range_))
+
+
+def price_baselines(price, closes):
+    """Per-period (baseline price, first in-period date) pairs.
+
+    The baseline price is the reference close a whole-period holder is
+    measured against; a lot opened on or after the first in-period date has
+    no exposure to that baseline and is measured from its cost instead.
+    """
+    today = today_local()
+    month_start = today.replace(day=1).isoformat()
+    year_start = today.replace(month=1, day=1).isoformat()
+    today_iso = today.isoformat()
+
+    def baseline(cutoff_iso):
+        prev = None
+        for day, close in closes:
+            if day < cutoff_iso:
+                prev = close
+            else:
+                break
+        return prev
+
+    # Previous trading close: the last close strictly before the most recent
+    # bar when that bar is today's live session, else the very last close.
+    prev_close, prev_date = None, None
+    if closes[-1][0] == today_iso and len(closes) >= 2:
+        prev_close, prev_date = closes[-2][1], closes[-2][0]
+    elif closes[-1][0] != today_iso:
+        prev_close, prev_date = closes[-1][1], closes[-1][0]
+        # After hours the live price equals the last close; compare that
+        # session against the one before it so D2D shows the day's move.
+        if price is not None and len(closes) >= 2 \
+                and abs(price - prev_close) < 1e-9:
+            prev_close, prev_date = closes[-2][1], closes[-2][0]
+
+    day_after_prev = None
+    if prev_date:
+        day_after_prev = (date.fromisoformat(prev_date)
+                          + timedelta(days=1)).isoformat()
+    return {"d2d": (prev_close, day_after_prev),
+            "mtd": (baseline(month_start), month_start),
+            "ytd": (baseline(year_start), year_start)}
+
+
+def period_returns(price, closes, lots=None):
+    """D2D / MTD / YTD returns of the holder's position.
+
+    With lot data, a lot opened inside a period is measured from its own
+    cost basis rather than the period-start price, so these are the user's
+    returns, not the ticker's. Lots without an open date (summary-level
+    Flex data, manual positions) behave like whole-period holdings, which
+    degrades to the plain price return.
+    """
+    if price is None or not closes:
+        return {"d2d": None, "mtd": None, "ytd": None}
+    bases = price_baselines(price, closes)
+    out = {}
+    for key, (base_px, first_in_period) in bases.items():
+        if not lots:
+            out[key] = None if (base_px is None or base_px == 0) \
+                else (price - base_px) / base_px
+            continue
+        base_total = 0.0
+        qty_total = 0.0
+        computable = True
+        for lot in lots:
+            qty = lot.get("qty") or 0.0
+            opened = lot.get("openDate")
+            qty_total += qty
+            in_period = (opened is not None and first_in_period is not None
+                         and opened >= first_in_period)
+            if not in_period and base_px is not None:
+                base_total += qty * base_px
+            elif lot.get("cost") is not None:
+                base_total += lot["cost"]
+            else:
+                computable = False
+                break
+        out[key] = (price * qty_total - base_total) / base_total \
+            if computable and base_total > 0 else None
+    return out
+
+
+# --------------------------------------------------------------- market hours
+
+def _easter(year):
+    """Gregorian Easter Sunday (anonymous algorithm)."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    g = (8 * b + 13) // 25
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return date(year, month, day + 1)
+
+
+def _nth_weekday(year, month, weekday, n):
+    d = date(year, month, 1)
+    offset = (weekday - d.weekday()) % 7
+    return d + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday(year, month, weekday):
+    d = date(year, month + 1, 1) - timedelta(days=1) if month < 12 \
+        else date(year, 12, 31)
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+
+def _observed(d):
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def us_market_holidays(year):
+    """Observed NYSE/Nasdaq full-day holidays for one year."""
+    days = [
+        _observed(date(year, 1, 1)),          # New Year's Day
+        _nth_weekday(year, 1, 0, 3),          # MLK Day
+        _nth_weekday(year, 2, 0, 3),          # Presidents' Day
+        _easter(year) - timedelta(days=2),    # Good Friday
+        _last_weekday(year, 5, 0),            # Memorial Day
+        _observed(date(year, 6, 19)),         # Juneteenth
+        _observed(date(year, 7, 4)),          # Independence Day
+        _nth_weekday(year, 9, 0, 1),          # Labor Day
+        _nth_weekday(year, 11, 3, 4),         # Thanksgiving
+        _observed(date(year, 12, 25)),        # Christmas
+    ]
+    return {d.isoformat() for d in days}
+
+
+def market_status():
+    """US equity market state plus next open/close as epoch seconds."""
+    from zoneinfo import ZoneInfo
+    from datetime import time as dtime
+    ny = ZoneInfo("America/New_York")
+    now = datetime.now(tz=ny)
+    holidays = set()
+    for y in (now.year - 1, now.year, now.year + 1):
+        holidays |= us_market_holidays(y)
+
+    def is_trading_day(d):
+        return d.weekday() < 5 and d.isoformat() not in holidays
+
+    def at(d, t):
+        return datetime.combine(d, t, tzinfo=ny)
+
+    open_t, close_t = dtime(9, 30), dtime(16, 0)
+    today = now.date()
+    state = "closed"
+    if is_trading_day(today):
+        if at(today, open_t) <= now < at(today, close_t):
+            state = "open"
+        elif now < at(today, open_t):
+            state = "premarket"
+        elif now < at(today, dtime(20, 0)):
+            state = "afterhours"
+
+    if state == "open":
+        next_open = at(today, open_t)
+        next_close = at(today, close_t)
+    else:
+        probe = today if (is_trading_day(today) and now < at(today, open_t)) \
+            else today + timedelta(days=1)
+        while not is_trading_day(probe):
+            probe += timedelta(days=1)
+        next_open = at(probe, open_t)
+        next_close = at(probe, close_t)
+
+    return {
+        "state": state,
+        "open": state == "open",
+        "nextOpen": int(next_open.timestamp()),
+        "nextClose": int(next_close.timestamp()),
+    }
+
+
+# ----------------------------------------------------------------------- fx
+
+def frankfurter_pair(base, quote):
+    """Latest rate + day-over-day change for base/quote via ECB rates."""
+    if base == quote:
+        return {"rate": 1.0, "d2d": 0.0}
+    start = (today_local() - timedelta(days=10)).isoformat()
+    url = ("https://api.frankfurter.dev/v1/%s..?base=%s&symbols=%s"
+           % (start, base, quote))
+    data = json.loads(http_get(url, headers={"Accept": "application/json"}))
+    rates = data.get("rates") or {}
+    days = sorted(rates.keys())
+    series = [rates[d].get(quote) for d in days if rates[d].get(quote)]
+    if not series:
+        raise RuntimeError("no ECB rate for %s/%s" % (base, quote))
+    rate = series[-1]
+    d2d = (rate - series[-2]) / series[-2] if len(series) >= 2 else None
+    return {"rate": rate, "d2d": d2d}
+
+
+def get_fx_pair(base, quote):
+    return cached("fx_%s%s" % (base, quote), 3600,
+                  lambda: frankfurter_pair(base, quote))
+
+
+def fx_display_rates(pairs):
+    out = []
+    for base, quote in pairs:
+        try:
+            p = get_fx_pair(base, quote)
+            out.append({"pair": "%s/%s" % (base, quote),
+                        "rate": p["rate"], "d2d": p["d2d"]})
+        except Exception as e:  # noqa: BLE001
+            out.append({"pair": "%s/%s" % (base, quote),
+                        "rate": None, "d2d": None, "error": str(e)})
+    return out
+
+
+def conversion_rate(cur, base_currency):
+    """cur → base_currency multiplier (1.0 on failure, so sums stay usable)."""
+    if cur == base_currency:
+        return 1.0
+    try:
+        return get_fx_pair(cur, base_currency)["rate"]
+    except Exception:
+        return 1.0
+
+
+# ----------------------------------------------------------------- IB Flex
+
+class FlexError(RuntimeError):
+    pass
+
+
+def flex_fetch_statement(token, query_id, timeout_s=75):
+    xml_text = http_get(
+        FLEX_SEND_URL + "?" + urllib.parse.urlencode(
+            {"t": token, "q": query_id, "v": "3"}),
+        timeout=30)
+    root = ET.fromstring(xml_text)
+    if (root.findtext("Status") or "").strip() != "Success":
+        raise FlexError("Flex SendRequest failed: %s (code %s)" % (
+            (root.findtext("ErrorMessage") or "unknown error").strip(),
+            (root.findtext("ErrorCode") or "?").strip()))
+    ref = (root.findtext("ReferenceCode") or "").strip()
+    url = (root.findtext("Url") or FLEX_GET_URL).strip()
+
+    deadline = time.time() + timeout_s
+    delay = 2.0
+    while True:
+        body = http_get(
+            url + "?" + urllib.parse.urlencode(
+                {"t": token, "q": ref, "v": "3"}),
+            timeout=30)
+        stripped = body.lstrip()
+        if stripped.startswith("<FlexQueryResponse"):
+            return ET.fromstring(body)
+        try:
+            err = ET.fromstring(body)
+            code = (err.findtext("ErrorCode") or "").strip()
+            msg = (err.findtext("ErrorMessage") or "").strip()
+        except ET.ParseError:
+            code, msg = "", body[:200]
+        # 1019 = statement generation in progress
+        if code not in ("1019", "1021") or time.time() > deadline:
+            raise FlexError("Flex GetStatement failed: %s (code %s)"
+                            % (msg or "timeout", code or "?"))
+        time.sleep(delay)
+        delay = min(delay * 1.5, 8.0)
+
+
+def flex_open_date(row):
+    """Lot open date as ISO, from openDateTime like '20250315;093000'."""
+    raw = (row.get("openDateTime") or row.get("holdingPeriodDateTime")
+           or "").strip()
+    digits = re.sub(r"\D", "", raw)[:8]
+    if len(digits) != 8:
+        return None
+    try:
+        return datetime.strptime(digits, "%Y%m%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def flex_parse_positions(root):
+    """Aggregate <OpenPosition> rows into one entry per (symbol, currency).
+
+    LOT-level rows are preferred: they carry per-lot open dates, which let
+    period returns be computed from the user's own entry points. Summary
+    rows are the fallback (one dateless lot per position).
+    """
+    rows = root.findall(".//OpenPosition")
+    lot_rows = [r for r in rows
+                if r.get("levelOfDetail", "").upper() == "LOT"]
+    if lot_rows:
+        rows = lot_rows
+    else:
+        summaries = [r for r in rows
+                     if r.get("levelOfDetail", "").upper() == "SUMMARY"]
+        if summaries:
+            rows = summaries
+    agg = {}
+    for r in rows:
+        sym = (r.get("symbol") or "").strip()
+        qty = fnum(r.get("position"))
+        if not sym or not qty:
+            continue
+        cost = fnum(r.get("costBasis"))
+        if cost is None:
+            per_share = fnum(r.get("costBasisPrice") or r.get("openPrice"))
+            cost = per_share * qty if per_share is not None else None
+        cur = (r.get("currency") or "USD").strip()
+        key = (sym, cur)
+        entry = agg.setdefault(key, {
+            "symbol": sym, "quantity": 0.0, "costBasis": 0.0,
+            "currency": cur, "costKnown": True, "lots": [],
+            "description": (r.get("description") or "").strip(),
+        })
+        entry["quantity"] += qty
+        entry["lots"].append({"qty": qty, "cost": cost,
+                              "openDate": flex_open_date(r)})
+        if cost is None:
+            entry["costKnown"] = False
+        else:
+            entry["costBasis"] += cost
+    out = []
+    for entry in agg.values():
+        if not entry["costKnown"]:
+            entry["costBasis"] = None
+        entry.pop("costKnown")
+        out.append(entry)
+    out.sort(key=lambda p: p["symbol"])
+    return out
+
+
+def yahoo_symbol(cfg, ib_symbol):
+    """Map an IBKR symbol to its market-data symbol.
+
+    Explicit "symbolMap" entries in the config win; otherwise class shares
+    like "BRK B" / "BRK.B" become "BRK-B".
+    """
+    mapping = (cfg or {}).get("symbolMap") or {}
+    if ib_symbol in mapping:
+        return mapping[ib_symbol]
+    return re.sub(r"[ .]", "-", ib_symbol.strip())
+
+
+def get_positions(cfg, force=False):
+    """Return (positions, source, warning)."""
+    flex = (cfg or {}).get("flex") or {}
+    token, query_id = flex.get("token"), flex.get("queryId")
+    manual = (cfg or {}).get("positions") or []
+    warning = None
+
+    if token and query_id:
+        max_age = float((cfg or {}).get("positionsCacheHours", 8)) * 3600
+        if force:
+            try:
+                os.remove(cache_path("flex_positions"))
+            except OSError:
+                pass
+        try:
+            positions = cached(
+                "flex_positions", max_age,
+                lambda: flex_parse_positions(
+                    flex_fetch_statement(str(token), str(query_id))))
+            if positions:
+                return positions, "ibkr-flex", None
+            warning = ("IBKR Flex returned no open positions — check that the "
+                       "Flex query includes the Open Positions section.")
+        except Exception as e:  # noqa: BLE001
+            warning = "IBKR Flex fetch failed: %s" % e
+
+    if manual:
+        positions = [{
+            "symbol": str(p.get("symbol", "")).strip(),
+            "quantity": fnum(p.get("quantity")) or 0.0,
+            "costBasis": fnum(p.get("costBasis")),
+            "currency": str(p.get("currency", "USD")).strip() or "USD",
+            "description": str(p.get("name", "")),
+            "lots": [{"qty": fnum(p.get("quantity")) or 0.0,
+                      "cost": fnum(p.get("costBasis")),
+                      "openDate": p.get("openDate")}],
+        } for p in manual if str(p.get("symbol", "")).strip()]
+        return positions, "manual", warning
+
+    return [], "none", warning
+
+
+# ------------------------------------------------------------------ modes
+
+def build_portfolio(cfg, force=False):
+    base_currency = (cfg or {}).get("baseCurrency", "USD")
+    fx_pairs = (cfg or {}).get("fxPairs") or [
+        ["USD", "ILS"], ["CHF", "ILS"], ["EUR", "ILS"]]
+
+    mstatus = market_status()
+    # Quotes barely move off-hours; stretch the price cache so closed-market
+    # refreshes are answered from disk instead of the network.
+    hist_max_age = {"open": 180, "premarket": 900,
+                    "afterhours": 900}.get(mstatus["state"], 3600)
+
+    positions, source, warning = get_positions(cfg, force=force)
+    if source == "none" and not warning:
+        warning = ("No positions configured. Add your IBKR Flex token and "
+                   "query id (or manual positions) to " + CONFIG_PATH)
+    if source == "ibkr-flex" and positions and not warning and not any(
+            lot.get("openDate")
+            for pos in positions for lot in pos.get("lots", [])):
+        warning = ("Flex query has no lot open dates, so D2D/MTD/YTD show "
+                   "plain price returns. In the query's Open Positions "
+                   "section set Level of Detail to Lot and include "
+                   "Open Date/Time.")
+
+    def enrich(pos):
+        market_symbol = yahoo_symbol(cfg, pos["symbol"])
+        row = {
+            "symbol": pos["symbol"],
+            "marketSymbol": market_symbol,
+            "name": pos.get("description") or "",
+            "qty": pos["quantity"],
+            "currency": pos.get("currency", "USD"),
+            "price": None, "value": None,
+            "d2d": None, "mtd": None, "ytd": None,
+            "unrealized": None, "unrealizedPct": None,
+            "error": None,
+        }
+        try:
+            hist = get_history(market_symbol, hist_max_age)
+        except Exception as e:  # noqa: BLE001
+            row["error"] = str(e)
+            return row
+        price = hist["price"]
+        row["price"] = price
+        row["currency"] = hist["currency"] or row["currency"]
+        if not row["name"]:
+            row["name"] = hist["name"]
+        row.update(period_returns(price, hist["closes"], pos.get("lots")))
+        if price is not None:
+            row["value"] = price * pos["quantity"]
+            cost = pos.get("costBasis")
+            if cost is not None:
+                row["unrealized"] = row["value"] - cost
+                if cost != 0:
+                    row["unrealizedPct"] = row["unrealized"] / cost
+        return row
+
+    rows = []
+    if positions:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            rows = list(pool.map(enrich, positions))
+    rows.sort(key=lambda r: -(r["value"] or 0))
+
+    # Portfolio aggregates, value-weighted in the base currency. Baseline
+    # values use today's FX rate, so these track the equity moves themselves.
+    total_value = 0.0
+    total_unrealized = 0.0
+    total_cost = 0.0
+    any_unrealized = False
+    base_totals = {"d2d": [0.0, 0.0], "mtd": [0.0, 0.0], "ytd": [0.0, 0.0]}
+    for row in rows:
+        if row["value"] is None:
+            continue
+        rate = conversion_rate(row["currency"], base_currency)
+        value = row["value"] * rate
+        row["valueBase"] = value
+        total_value += value
+        if row["unrealized"] is not None:
+            total_unrealized += row["unrealized"] * rate
+            total_cost += (row["value"] - row["unrealized"]) * rate
+            any_unrealized = True
+        for key in ("d2d", "mtd", "ytd"):
+            r = row[key]
+            if r is None or r <= -1:
+                continue
+            prior = value / (1.0 + r)
+            base_totals[key][0] += value
+            base_totals[key][1] += prior
+
+    def agg(key):
+        cur, prior = base_totals[key]
+        if prior <= 0:
+            return None
+        return (cur - prior) / prior
+
+    return {
+        "ok": True,
+        "asOf": int(time.time()),
+        "baseCurrency": base_currency,
+        "source": source,
+        "warning": warning,
+        "fx": fx_display_rates([tuple(p) for p in fx_pairs]),
+        "market": mstatus,
+        "portfolio": {
+            "value": total_value if rows else None,
+            "d2d": agg("d2d"), "mtd": agg("mtd"), "ytd": agg("ytd"),
+            "all": (total_unrealized / total_cost)
+            if any_unrealized and total_cost > 0 else None,
+            "unrealized": total_unrealized if any_unrealized else None,
+        },
+        "positions": rows,
+    }
+
+
+def google_news(query, limit=8):
+    url = ("https://news.google.com/rss/search?"
+           + urllib.parse.urlencode(
+               {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}))
+    root = ET.fromstring(http_get(url, timeout=10))
+    items = []
+    for item in root.findall(".//item")[:limit]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        source = (item.findtext("source") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        when = None
+        if pub:
+            try:
+                when = int(email.utils.parsedate_to_datetime(pub).timestamp())
+            except (TypeError, ValueError):
+                when = None
+        if source and title.endswith(" - " + source):
+            title = title[:-(len(source) + 3)].rstrip()
+        if title and link.startswith("http"):
+            items.append({"title": title, "link": link,
+                          "publisher": source, "time": when})
+    return items
+
+
+def build_detail(cfg, symbol):
+    positions, _source, _warning = get_positions(cfg)
+    held = next((p for p in positions if p["symbol"] == symbol), None)
+    market_symbol = yahoo_symbol(cfg, symbol)
+    hist = get_history(market_symbol, 300, "5y")
+
+    qty = held["quantity"] if held else None
+    cost = held.get("costBasis") if held else None
+    series = []
+    for day, close in hist["closes"]:
+        pnl = (qty * close - cost) if (qty is not None and cost is not None) \
+            else None
+        series.append([day, close, pnl])
+    # Extend the series to the live price so the chart ends "now".
+    today_iso = today_local().isoformat()
+    price = hist["price"]
+    if price is not None and series and series[-1][0] != today_iso:
+        pnl = (qty * price - cost) if (qty is not None and cost is not None) \
+            else None
+        series.append([today_iso, price, pnl])
+
+    # Position entry points (needs lot-level Flex data or manual openDate).
+    entries = []
+    for lot in (held or {}).get("lots", []):
+        if not lot.get("openDate"):
+            continue
+        lot_qty = lot.get("qty") or 0
+        lot_cost = lot.get("cost")
+        entries.append({
+            "date": lot["openDate"],
+            "qty": lot_qty,
+            "price": (lot_cost / lot_qty)
+            if (lot_cost is not None and lot_qty) else None,
+        })
+    entries.sort(key=lambda e: e["date"])
+
+    name = (held or {}).get("description") or hist["name"] or symbol
+    news_query = "%s stock" % symbol
+    if name and name.upper() != symbol.upper():
+        news_query = "%s OR \"%s\"" % (news_query, name)
+    try:
+        news = cached("news_" + symbol, 900, lambda: google_news(news_query))
+    except Exception:  # noqa: BLE001
+        news = []
+
+    stats = period_returns(price, hist["closes"],
+                           held.get("lots") if held else None)
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "name": name,
+        "currency": hist["currency"],
+        "price": price,
+        "qty": qty,
+        "costBasis": cost,
+        "value": (price * qty) if (price is not None and qty) else None,
+        "unrealized": (price * qty - cost)
+        if (price is not None and qty and cost is not None) else None,
+        "unrealizedPct": (price * qty - cost) / cost
+        if (price is not None and qty and cost) else None,
+        "d2d": stats["d2d"], "mtd": stats["mtd"], "ytd": stats["ytd"],
+        "series": series,
+        "entries": entries,
+        "news": news,
+    }
+
+
+# ------------------------------------------------------------------ AI summary
+
+def default_agent():
+    """The machine-wide default coding agent, as configured in Omarchy."""
+    import subprocess
+    try:
+        out = subprocess.run(["omarchy-default-agent"], capture_output=True,
+                             text=True, timeout=10).stdout.strip()
+    except Exception:  # noqa: BLE001
+        out = ""
+    if not out:
+        try:
+            with open(os.path.expanduser(
+                    "~/.config/omarchy/defaults/agent")) as f:
+                out = f.read().strip()
+        except OSError:
+            out = ""
+    return out
+
+
+def agent_command(agent, prompt, model=None):
+    """Headless one-shot invocation for each supported agent CLI."""
+    if agent == "claude":
+        cmd = ["claude", "-p", prompt,
+               "--allowedTools", "WebSearch", "WebFetch",
+               "--output-format", "json"]
+        if model:
+            cmd += ["--model", model]
+        return cmd
+    if agent == "codex":
+        cmd = ["codex", "exec", "--skip-git-repo-check"]
+        if model:
+            cmd += ["--model", model]
+        return cmd + [prompt]
+    if agent == "opencode":
+        cmd = ["opencode", "run"]
+        if model:
+            cmd += ["--model", model]
+        return cmd + [prompt]
+    if agent == "crush":
+        # crush run has no model flag; it uses the model from crush's config.
+        return ["crush", "run", prompt]
+    # gemini, grok, copilot, pi, omp and friends all take -p <prompt>
+    cmd = [agent, "-p", prompt]
+    if model:
+        cmd += ["--model", model]
+    return cmd
+
+
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07", "", text)
+
+
+def build_ai_prompt(cfg, symbol):
+    positions, _source, _warning = get_positions(cfg)
+    held = next((p for p in positions if p["symbol"] == symbol), None)
+    market_symbol = yahoo_symbol(cfg, symbol)
+    hist = get_history(market_symbol, 3600)
+    price = hist["price"]
+    name = (held or {}).get("description") or hist["name"] or symbol
+    stats = period_returns(price, hist["closes"],
+                           held.get("lots") if held else None)
+
+    lines = []
+    if held:
+        cost = held.get("costBasis")
+        value = price * held["quantity"] if price is not None else None
+        lines.append("- My position: %s shares of %s; market value %s %s%s"
+                     % (held["quantity"], symbol,
+                        round(value, 2) if value is not None else "?",
+                        held.get("currency", "USD"),
+                        ("; unrealized P&L %+.0f" % (value - cost))
+                        if (value is not None and cost is not None) else ""))
+    pct = lambda x: "n/a" if x is None else "%+.1f%%" % (x * 100)  # noqa: E731
+    lines.append("- %s price %s; my returns: day %s, MTD %s, YTD %s"
+                 % (symbol, price, pct(stats["d2d"]), pct(stats["mtd"]),
+                    pct(stats["ytd"])))
+
+    total = 0.0
+    values = []
+    for pos in positions:
+        try:
+            h = get_history(yahoo_symbol(cfg, pos["symbol"]), 3600)
+            v = (h["price"] or 0) * pos["quantity"]
+        except Exception:  # noqa: BLE001
+            v = 0.0
+        values.append((pos["symbol"], v))
+        total += v
+    if total > 0:
+        weights = ", ".join("%s %.1f%%" % (sym, 100 * v / total)
+                            for sym, v in
+                            sorted(values, key=lambda x: -x[1]))
+        lines.append("- My full portfolio by weight: " + weights)
+
+    try:
+        news = cached("news_" + symbol, 900,
+                      lambda: google_news("%s stock" % symbol))
+    except Exception:  # noqa: BLE001
+        news = []
+    if news:
+        lines.append("- Recent headlines:")
+        for n in news[:8]:
+            lines.append("  - %s (%s)" % (n["title"], n["publisher"]))
+
+    return (
+        "You are a concise financial assistant inside a small desktop "
+        "widget. Write a short, easy-to-read Markdown summary about "
+        "%s (%s) for its shareholder. Output exactly three bullets, each "
+        "starting with a fitting emoji, 1-2 sentences each — no headers, "
+        "no preamble, no closing line:\n"
+        "1. The single most important recent news item relevant to "
+        "shareholders/traders of this company, and why it matters.\n"
+        "2. One sentence on what top analysts currently say about the "
+        "stock (consensus rating / price target if you know it).\n"
+        "3. An out-of-the-box, actionable tip for this specific holder "
+        "that takes their position and the rest of their portfolio into "
+        "account (think concentration, overlap/correlation between "
+        "holdings, hedging, rebalancing) — not generic advice.\n"
+        "Keep it under 130 words total. Bold the key numbers and "
+        "tickers. No disclaimers.\n\nContext:\n%s"
+        % (name, symbol, "\n".join(lines)))
+
+
+AI_CACHE_TTL = 24 * 3600
+
+
+def build_ai(cfg, symbol, cached_only=False, force=False):
+    # Config can pin the agent and/or model for summaries; otherwise the
+    # machine-wide default agent (with its own default model) is used.
+    ai_cfg = (cfg or {}).get("ai") or {}
+    agent = str(ai_cfg.get("agent") or "").strip() or default_agent()
+    model = str(ai_cfg.get("model") or "").strip() or None
+    if not agent:
+        return {"ok": False, "symbol": symbol,
+                "error": "No default agent configured. Run: "
+                         "omarchy default agent claude"}
+
+    cache_name = "ai_%s_%s_%s" % (agent, model or "default", symbol)
+    if cached_only:
+        entry = read_json_file(cache_path(cache_name))
+        if entry and (time.time() - entry.get("t", 0)) < AI_CACHE_TTL:
+            return {"ok": True, "symbol": symbol, **entry["v"]}
+        return {"ok": False, "miss": True, "symbol": symbol}
+    if force:
+        try:
+            os.remove(cache_path(cache_name))
+        except OSError:
+            pass
+
+    def generate():
+        import subprocess
+        prompt = build_ai_prompt(cfg, symbol)
+        cmd = agent_command(agent, prompt, model)
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=180, cwd=os.path.expanduser("~"))
+        out = strip_ansi(res.stdout or "").strip()
+        if res.returncode != 0 or not out:
+            raise RuntimeError("%s failed: %s" % (
+                agent, strip_ansi(res.stderr or "")[-300:] or "empty output"))
+        meta = {}
+        if agent == "claude":
+            # --output-format json wraps the text in an envelope that also
+            # carries the model and token/cost accounting.
+            envelope = json.loads(out)
+            if envelope.get("is_error"):
+                raise RuntimeError("claude failed: %s"
+                                   % str(envelope.get("result"))[:300])
+            out = str(envelope.get("result") or "").strip()
+            if not out:
+                raise RuntimeError("claude returned an empty result")
+            usage = envelope.get("usage") or {}
+            model_usage = envelope.get("modelUsage") or {}
+            main = max(model_usage.values(),
+                       key=lambda u: u.get("costUSD") or 0) \
+                if model_usage else {}
+            meta = {
+                "model": main.get("canonicalModel"),
+                "inputTokens": sum(usage.get(k) or 0 for k in (
+                    "input_tokens", "cache_read_input_tokens",
+                    "cache_creation_input_tokens")),
+                "outputTokens": usage.get("output_tokens"),
+                "costUsd": envelope.get("total_cost_usd"),
+            }
+        return {"summary": out, "agent": agent,
+                "generatedAt": int(time.time()), **meta}
+
+    result = cached(cache_name, AI_CACHE_TTL, generate)
+    return {"ok": True, "symbol": symbol, **result}
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "portfolio"
+    cfg = load_config()
+    try:
+        if cfg is None:
+            print(json.dumps({
+                "ok": False, "needsConfig": True,
+                "error": "No config at %s — copy config.example.json there "
+                         "and add your IBKR Flex token." % CONFIG_PATH}))
+            return
+        if mode == "portfolio":
+            print(json.dumps(build_portfolio(cfg)))
+        elif mode == "refresh-positions":
+            print(json.dumps(build_portfolio(cfg, force=True)))
+        elif mode == "detail":
+            if len(sys.argv) < 3:
+                raise ValueError("detail mode needs a symbol")
+            print(json.dumps(build_detail(cfg, sys.argv[2])))
+        elif mode == "ai":
+            if len(sys.argv) < 3:
+                raise ValueError("ai mode needs a symbol")
+            flags = sys.argv[3:]
+            print(json.dumps(build_ai(
+                cfg, sys.argv[2],
+                cached_only="--cached-only" in flags,
+                force="--force" in flags)))
+        else:
+            raise ValueError("unknown mode: %s" % mode)
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": str(e)}))
+
+
+if __name__ == "__main__":
+    main()
